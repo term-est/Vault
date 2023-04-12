@@ -8,9 +8,10 @@ add_library(range_v3 INTERFACE IMPORTED Serializer.hpp Serializer.hpp)
 set_target_properties(range_v3 PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/range-v3/include")
 
+find_package(unofficial-mongoose CONFIG REQUIRED)
 
 add_executable(Vault main.cpp)
-target_link_libraries(Vault PUBLIC range_v3)
+target_link_libraries(Vault PUBLIC range_v3 unofficial::mongoose::mongoose ws2_32)
 target_compile_options(Vault PUBLIC -fconcepts-diagnostics-depth=100)
 
 # add tests

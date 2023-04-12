@@ -434,7 +434,7 @@ class Vault
 		}
 
 
-		bool modify(const Key& key, Value value)
+		bool update(const Key& key, Value value)
 		{
 			const std::size_t hash = std::hash<Key>{}(key);
 
@@ -477,15 +477,7 @@ class Vault
 			for (auto& entry : vault.cache.entries)
 			{
 				if (entry.key == key)
-				{
-					entry.value = value;
-					entry.operation = Cache<Key, Value>::Operation::Update;
-
-					// add the hash to the hash map
-					vault.hash_map.insert(hash);
-
-					return true;
-				}
+					return false;
 			}
 
 			// check if we have the correct bucket
@@ -510,6 +502,41 @@ class Vault
 
 			return true;
 		}
+
+		[[nodiscard]]
+		bool remove(const Key& key) noexcept
+		{
+			const std::size_t hash = std::hash<Key>{}(key);
+
+			// if hash does not exist in the hash map, return false
+			if (not vault.hash_map.count(hash))
+				return false;
+
+			// check the cache
+			for (auto& entry : vault.cache.entries)
+			{
+				if (entry.key == key)
+				{
+					entry.operation = Cache<Key, Value>::Operation::Remove;
+
+					// remove the hash from the map
+					vault.hash_map.erase(hash);
+
+					return true;
+				}
+			}
+
+			// add operation to the cache to be performed later
+			vault.cache.entries.push_back(typename Cache<Key, Value>::Entry{name, key, Value{}, Cache<Key, Value>::Operation::Remove});
+			vault.hash_map.erase(hash);
+
+			// if the cache is full, flush it
+			if (vault.cache.entries.size() >= cache_size)
+				vault.flush();
+
+			return true;
+		}
+
 	};
 
 public:
