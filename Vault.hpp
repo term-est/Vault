@@ -10,6 +10,7 @@
 #include <span>
 #include <ranges>
 #include <dirent.h>
+#include <unistd.h>
 
 #include "nlohmann/json.hpp"
 #include "range/v3/all.hpp"
@@ -18,12 +19,32 @@
 
 namespace MILI::Database
 {
+	static constexpr const char* const database_path = "/MILI/Vault/";
+
 	using namespace std::literals;
 
 	namespace details
 	{
 
-	struct DefaultSerializer{};
+	template <typename Key, typename Value>
+	struct DefaultSerializer
+	{
+		static auto serialize(Key key) noexcept
+		{
+			return MILI::serialize(key);
+		}
+
+		static auto serialize(Value value) noexcept
+		{
+			return MILI::serialize(value);
+		}
+
+		template <typename T>
+		static auto deserialize(std::span<const std::byte> buffer) noexcept
+		{
+			return MILI::deserialize<T>(buffer);
+		}
+	};
 
 	struct Header
 	{
@@ -60,11 +81,11 @@ namespace MILI::Database
 		}
 	};
 
-	template <typename Key, typename Value, std::size_t BucketSize = 128>
-	struct Engine;
+	template <typename Key, typename Value, typename Serializer, std::size_t BucketSize = 128>
+	class Engine;
 
-	// todo: use static memory
-	template <typename Key, typename Value, typename  Container = std::vector<std::pair<Key, Value>>>
+// todo: use static memory
+	template <typename Key, typename Value, typename Serializer, typename Container = std::map<Key, Value>>
 	class Bucket
 	{
 	public:
@@ -79,26 +100,28 @@ namespace MILI::Database
 		bool flush() noexcept
 		{
 			needs_flusing = false;
-			FILE* file = fopen(("MILI/Vault/" + db_name + "/" + table_name + "/fragment" + std::to_string(id)).c_str(), "wb");
+			FILE* file = fopen((database_path + db_name + "/" + table_name + "/fragment" + std::to_string(id)).c_str(), "wb");
 
 			if (!file)
 				return false;
 
 			Header header;
-			header.len = data.size();
+			header.len = static_cast<std::uint16_t>(data.size());
 			fwrite(header.serialize().data(), 16, 1, file);
 
 			// TODO: fix serialization
+
+
 			for (const auto& e : data)
 			{
-				auto serialized_key = MILI::serialize(e.first);
+				auto serialized_key = Serializer::serialize(e.first);
 				auto serialized_key_size = MILI::serialize<std::uint16_t>(serialized_key.size());
 
 				fwrite(serialized_key_size.data(), sizeof(serialized_key_size), 1, file);
 				fwrite(serialized_key.data(), serialized_key.size(), 1, file);
 				header.size += serialized_key_size.size() + sizeof(serialized_key_size);
 
-				auto serialized_value = MILI::serialize(e.second);
+				auto serialized_value = Serializer::serialize(e.second);
 				auto serialized_val_size = MILI::serialize<std::uint16_t>(serialized_value.size());
 
 				fwrite(serialized_val_size.data(), sizeof(serialized_val_size), 1, file);
@@ -117,7 +140,7 @@ namespace MILI::Database
 
 		bool update(const Key& key, Value value)
 		{
-			auto itr = std::find_if(data.begin(), data.end(), [&](const std::pair<Key, Value>& candidate) { return candidate.first == key; });
+			auto itr = data.find(key);
 
 			if (itr == data.end())
 				return false;
@@ -130,7 +153,7 @@ namespace MILI::Database
 
 		bool remove(const Key& key) noexcept
 		{
-			auto itr = std::find_if(data.begin(), data.end(), [&](const std::pair<Key, Value>& candidate) { return candidate.first == key; });
+			auto itr = data.find(key);
 
 			if (itr == data.end())
 				return false;
@@ -143,21 +166,20 @@ namespace MILI::Database
 
 		bool insert(Key key, Value value) noexcept
 		{
-			auto itr = std::find_if(data.begin(), data.end(), [&](const std::pair<Key, Value>& candidate) { return candidate.first == key; });
+			auto itr = data.find(key);
 
-			// Element alreadt exists!
 			if (itr != data.end())
 				return false;
 
 			needs_flusing = true;
-			data.emplace_back(key, value);
+			data[key] = value;
 
 			return true;
 		}
 
 		std::optional<Value> read(const Key& key) noexcept
 		{
-			auto itr = std::find_if(data.begin(), data.end(), [&](const std::pair<Key, Value>& candidate) { return candidate.first == key; });
+			auto itr = data.find(key);
 
 			if (itr == data.end())
 				return std::nullopt;
@@ -186,13 +208,13 @@ namespace MILI::Database
 
 	private:
 
-		template <typename K, typename V, std::size_t BucketSize>
+		template <typename K, typename V, typename Serializer_, std::size_t BucketSize>
 		friend class Engine;
 
 		explicit Bucket(std::string_view db, std::string_view tbl_name, std::size_t bucket_idx) noexcept : db_name{db}, table_name{tbl_name}, id{bucket_idx}
 		{
 			Header header{};
-			FILE* file = fopen(("MILI/Vault/" + db_name + "/" + table_name + "/fragment" + std::to_string(id)).c_str(), "rb");
+			FILE* file = fopen((database_path + db_name + "/" + table_name + "/fragment" + std::to_string(id)).c_str(), "rb");
 
 			if (not file)
 				return;
@@ -208,7 +230,6 @@ namespace MILI::Database
 			if (not header.construct(raw_header))
 				return;
 
-			data.reserve(header.len);
 
 			auto get_size = [&]() -> std::uint16_t
 			{
@@ -220,6 +241,7 @@ namespace MILI::Database
 				return MILI::deserialize<std::uint16_t>(data_info);
 			};
 
+
 			std::vector<std::byte> buffer;
 
 			while (std::uint16_t size = get_size())
@@ -228,7 +250,7 @@ namespace MILI::Database
 				if (fread(buffer.data(), sizeof(std::byte), size, file) != size)
 					break;
 
-				Key key = MILI::deserialize<Key>(buffer);
+				Key key = Serializer::template deserialize<Key>(std::span<const std::byte>(buffer.data(), buffer.size()));
 				buffer.clear();
 
 				size = get_size();
@@ -236,9 +258,9 @@ namespace MILI::Database
 				if (fread(buffer.data(), sizeof(std::byte), size, file) != size)
 					break;
 
-				Value val = MILI::deserialize<Value>(buffer);
+				Value val = Serializer::template deserialize<Value>(std::span<const std::byte>(buffer.data(), buffer.size()));
 
-				data.emplace_back(key, val);
+				data[key] = val;
 				buffer.clear();
 			}
 
@@ -253,11 +275,13 @@ namespace MILI::Database
 		bool needs_flusing = false;
 	};
 
-	template <typename Key, typename Value, std::size_t BucketSize>
-	struct Engine
+	template <typename Key, typename Value, typename Serializer, std::size_t BucketSize>
+	class Engine
 	{
 		std::string_view db_name;
 		std::set<std::string_view> data;
+	public:
+
 		constexpr static std::size_t bucket_size = BucketSize;
 
 		explicit Engine(std::string_view name) noexcept : db_name{name}
@@ -266,7 +290,7 @@ namespace MILI::Database
 		bool integrity_check() noexcept
 		{
 			// check if a folder named /MILI/Vault/ exists
-			DIR* dir = opendir("MILI/Vault/");
+			DIR* dir = opendir(database_path);
 
 			if (not dir)
 				return false;
@@ -281,14 +305,14 @@ namespace MILI::Database
 
 		void construct() noexcept
 		{
-			for (auto dir : {"MILI", "MILI/Vault"})
-				mkdir(dir);
+			for (auto dir : {"/MILI", "/MILI/Vault"})
+				mkdir(dir, 0777);
 		}
 
-		auto get_bucket(std::string_view table_name, std::size_t bucket_number) noexcept -> std::optional<details::Bucket<Key, Value>>
+		auto get_bucket(std::string_view table_name, std::size_t bucket_number) noexcept -> std::optional<details::Bucket<Key, Value, Serializer>>
 		{
 			// convert read file named table_name from the disk under the MILI/Vault/ directory
-			std::string&& path = "MILI/Vault/" + std::string{db_name} + "/" + std::string{table_name};
+			std::string&& path = database_path + std::string{db_name} + "/" + std::string{table_name};
 			std::string&& filename = path + "/fragment" + std::to_string(bucket_number);
 			// check if file exists
 			FILE* file = fopen(filename.c_str(), "r");
@@ -296,8 +320,8 @@ namespace MILI::Database
 			if (not file)
 			{
 				using namespace std::literals;
-				for (const auto& dir : {"MILI"s, "MILI/Vault"s, ("MILI/Vault/" + std::string{db_name}), path})
-					mkdir(dir.c_str());
+				for (const auto& dir : {"/MILI"s, "/MILI/Vault"s, (database_path + std::string{db_name}), path})
+					mkdir(dir.c_str(), 0777);
 
 				Header header{};
 
@@ -312,7 +336,7 @@ namespace MILI::Database
 				fwrite(serialized_header.data(), sizeof(std::byte), 16, file);
 				fclose(file);
 
-				return Bucket<Key, Value>{db_name, table_name, bucket_number};
+				return Bucket<Key, Value, Serializer>{db_name, table_name, bucket_number};
 			}
 
 			// read	header
@@ -322,7 +346,7 @@ namespace MILI::Database
 			header.construct(header_data);
 			fclose(file);
 
-			return Bucket<Key, Value>{db_name, table_name, bucket_number};
+			return Bucket<Key, Value, Serializer>{db_name, table_name, bucket_number};
 		}
 	};
 
@@ -351,11 +375,11 @@ struct Cache
 
 
 
-template <typename Key, typename Value, typename Serializer = details::DefaultSerializer>
+template <typename Key, typename Value, typename Serializer = details::DefaultSerializer<Key, Value>>
 class Vault
 {
 	constexpr static std::size_t cache_size = 16;
-	using Engine = details::Engine<Key, Value, 64>;
+	using Engine = details::Engine<Key, Value, Serializer, 64>;
 	using bucket_t = decltype(std::declval<Engine>().get_bucket("table_name", 0));
 
 	Engine engine{};
@@ -367,13 +391,13 @@ class Vault
 	explicit Vault(Engine eng, std::string_view db_name = "Vault") noexcept : engine{eng}, name{db_name}
 	{
 		// initialize the hash map
-		FILE* hash_file = fopen(("MILI/Vault/" + name + ".hash").c_str()  , "rb");
+		FILE* hash_file = fopen((database_path + name + ".hash").c_str()  , "rb");
 
 		// read the file if it exists
 		if (hash_file)
 		{
 			std::array<std::byte, sizeof(std::size_t)> data{};
-			fread(data.data(), sizeof(std::byte), data.size(), hash_file) == data.size();
+			fread(data.data(), sizeof(std::byte), data.size(), hash_file);
 
 			auto&& size = MILI::deserialize<std::size_t>(data);
 
@@ -386,7 +410,6 @@ class Vault
 
 
 		fclose(hash_file);
-
 	}
 
 	class Table
@@ -424,13 +447,15 @@ class Vault
 			}
 
 			// check if we have the correct bucket
-			if (not vault.bucket or vault.bucket->get_name() != name or vault.bucket->get_id() != hash % vault.engine.bucket_size)
+			if (not vault.bucket or vault.bucket->get_name() != name or vault.bucket->get_id() != (hash % vault.engine.bucket_size))
 			{
 				vault.bucket = std::nullopt;
 				vault.bucket = vault.engine.get_bucket(name, hash % vault.engine.bucket_size);
 			}
 
-			return vault.bucket->read(key);
+			auto ret = vault.bucket->read(key);
+
+			return ret;
 		}
 
 
@@ -447,6 +472,9 @@ class Vault
 			{
 				if (entry.key == key)
 				{
+					if (entry.operation == Cache<Key, Value>::Operation::Remove)
+						return false;
+
 					entry.value = value;
 					entry.operation = Cache<Key, Value>::Operation::Update;
 
@@ -459,11 +487,11 @@ class Vault
 			// add the entry to the cache
 			vault.cache.entries.push_back(typename Cache<Key, Value>::Entry{name, key, value, Cache<Key, Value>::Operation::Update});
 
-			if (vault.cache.entries.size() > cache_size)
-				vault.flush();
-
 			// add the hash to the hash map
 			vault.hash_map.insert(hash);
+
+			if (vault.cache.entries.size() > cache_size)
+				vault.flush();
 
 			return true;
 		}
@@ -473,11 +501,21 @@ class Vault
 		{
 			const std::size_t hash = std::hash<Key>{}(key);
 
-			// check the cache
+			// search the cache to make sure that we don't have in it
 			for (auto& entry : vault.cache.entries)
 			{
 				if (entry.key == key)
-					return false;
+				{
+					if (entry.operation != Cache<Key, Value>::Operation::Remove)
+						return false;
+
+					entry.value = value;
+					entry.operation = Cache<Key, Value>::Operation::Update;
+
+					// add the hash to the hash map
+					vault.hash_map.insert(hash);
+					return true;
+				}
 			}
 
 			// check if we have the correct bucket
@@ -517,11 +555,13 @@ class Vault
 			{
 				if (entry.key == key)
 				{
+					if (entry.operation == Cache<Key, Value>::Operation::Remove)
+						return false;
+
 					entry.operation = Cache<Key, Value>::Operation::Remove;
 
 					// remove the hash from the map
 					vault.hash_map.erase(hash);
-
 					return true;
 				}
 			}
@@ -597,11 +637,19 @@ public:
 
 			switch (entry.operation)
 			{
-				case Cache<Key, Value>::Operation::Insert: bucket.value().insert(entry.key, entry.value);
-					break;
+				case Cache<Key, Value>::Operation::Insert:
 
-				case Cache<Key, Value>::Operation::Update: bucket.value().update(entry.key, entry.value);
-					break;
+					if (not bucket.value().insert(entry.key, entry.value))
+						assert(bucket.value().update(entry.key, entry.value));
+
+				break;
+
+				case Cache<Key, Value>::Operation::Update:
+
+					if (not bucket.value().update(entry.key, entry.value))
+						assert(bucket.value().insert(entry.key, entry.value));
+
+				break;
 
 				case Cache<Key, Value>::Operation::Remove: bucket.value().remove(entry.key);
 					break;
@@ -613,8 +661,20 @@ public:
 
 		cache.entries.clear();
 
-		if (bucket)
-			return bucket->flush();
+		auto&& hash_data = MILI::serialize(hash_map);
+		auto&& hash_size = MILI::serialize(hash_map.size());
+
+		FILE* hash_file = fopen((database_path + name + ".hash").c_str(), "wb");
+
+		if (not hash_file)
+			return false;
+
+		fwrite(hash_size.data(), hash_size.size(), 1, hash_file);
+		fwrite(hash_data.data(), hash_data.size(), 1, hash_file);
+
+		fclose(hash_file);
+
+		bucket = std::nullopt;
 
 		return false;
 	}
@@ -628,12 +688,6 @@ public:
 		// serialize the hash map and write it to a file
 		auto&& hash_data = MILI::serialize(hash_map);
 		auto&& hash_size = MILI::serialize(hash_map.size());
-
-		FILE* hash_file = fopen(("MILI/Vault/" + name + ".hash").c_str(), "wb");
-		fwrite(hash_size.data(), hash_size.size(), 1, hash_file);
-		fwrite(hash_data.data(), hash_data.size(), 1, hash_file);
-
-		fclose(hash_file);
 	}
 
 };
